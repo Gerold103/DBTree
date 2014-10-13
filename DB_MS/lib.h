@@ -1,35 +1,19 @@
 #ifndef _LIB_H
 #define _LIB_H
+#define DB_KEYS_PER_NODE 3
 
 //----------------------------------------------------------------
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 
-//-----------------------------------------------------D A T A   B A S E   T Y P E----------------------------------------------------
+struct DBT;
 
-struct DBT {
-     void  *data;
-     size_t size;
-};
-
-//----------------------------------------------------------D A T A   B A S E----------------------------------------------------------
-
-struct __DB_private__;
+struct DBPrivate;
 
 struct DB {
-    /* Public API */
-    int (*close)(struct DB *db);
-    int (*del)(const struct DB *db, const struct DBT *key);
-    int (*get)(const struct DB *db, struct DBT *key, struct DBT *data);
-    int (*put)(const struct DB *db, struct DBT *key, const struct DBT *data);
-    size_t (*getMaxSize)(const struct DB *db);
-    size_t (*getCurrentSize)(const struct DB *db);
-    size_t (*getChunkSize)(const struct DB *db);
-    size_t (*getMemSize)(const struct DB *db);
-    //int (*sync)(const struct DB *db);
-	/* Private API */
-	struct __DB_private__ *private;
-}; /* Need for supporting multiple backends (HASH/BTREE) */
+    struct DBPrivate *p;
+};
 
 //---------------------------------------------------D A T A   B A S E   C O N F I G---------------------------------------------------
 
@@ -39,13 +23,17 @@ struct DBC {
         size_t db_size;
         /* Maximum chunk (node/data chunk) size */
         /* 4KB by default */
-        size_t chunk_size;
+        size_t page_size;
         /* Maximum memory size */
         /* 16MB by default */
         size_t mem_size;
 };
 
-struct DB *dbcreate(const char *file, const struct DBC *conf);
-struct DB *dbopen  (const char *file); /* Metadata in file */
+struct DB *dbcreate(char *file, struct DBC config);
+struct DB *dbopen(char *file);
+/*void db_close(struct DB *db);
+int  db_del  (struct DB *db, void *key, size_t key_len);
+int  db_get  (struct DB *db, void *key, size_t key_len, void **val, size_t *val_len);
+int  db_put  (struct DB *db, void *key, size_t key_len, void *val, size_t val_len);*/
 
 #endif
