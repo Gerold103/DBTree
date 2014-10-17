@@ -5,4 +5,6 @@
 
 bool bit_test(const void *data, size_t pos);
 
+bool bit_set(void *data, size_t pos);
+
 #endif

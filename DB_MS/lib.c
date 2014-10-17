@@ -7,60 +7,8 @@
 #include "lib.h"
 #include "bit.h"
 
-#define K 4
 
-enum Flags {
-    IS_LEAF = 0x01,
-    IS_TOP  = 0x02
-};
 
-//----------------------------------------------------------D A T A   B A S E----------------------------------------------------------
-
-struct DBMeta {
-    uint32_t page_size;
-    uint32_t db_size;
-};
-
-struct DBSizes {
-    size_t pages_count;
-    size_t pages_for_bitmask;
-    size_t node_meta_size;
-    size_t one_pair_size;
-    size_t top_page;
-    size_t nodes;
-};
-
-struct PoolPages {
-    void *bitmask;
-    struct DBSizes sizes;
-    int fd;
-};
-
-struct DBT {
-    void *bytes;
-    size_t size;
-};
-
-struct NodeMeta {
-    size_t page;
-    size_t parent_page;
-    size_t flags;
-    size_t size;
-};
-
-struct Node {
-    struct NodeMeta meta;
-    size_t childs[K + 1]; //child pages
-    struct DBT keys[K];
-    struct DBT values[K];
-};
-
-struct DBPrivate {
-    char *db_name;
-    struct Node *top;
-    struct PoolPages pool;
-    struct DBMeta meta;
-};
 
 //------------------------------------------------A U X I L I A R Y   F U N C T I O N S------------------------------------------------
 
@@ -69,7 +17,7 @@ void _init_pool(struct PoolPages *pool, int fd, size_t page_size, size_t db_size
 struct Node *_init_node(size_t parent_page, size_t flags, size_t size, size_t childs_size,
                         size_t *childs, struct DBT *keys, struct DBT *values);
 
-bool _dump_node(struct DB *db, struct Node *node);
+bool _dump_new_node(struct DB *db, struct Node *node);
 
 struct Node *_read_node_from_page(struct DB *db, size_t page);
 
@@ -84,7 +32,7 @@ struct DB *dbcreate(char *file, struct DBC config)
     size_t page_size = config.page_size;
     int fd = open(file, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
 
-    posix_fallocate(res->p->pool.fd, 0, config.db_size);
+    posix_fallocate(res->p->pool.fd, 0, config.db_size + sizeof(struct DBMeta));
 
     res->p->db_name = file;
     res->p->meta.db_size = db_size;
@@ -93,8 +41,8 @@ struct DB *dbcreate(char *file, struct DBC config)
     _init_pool(&(res->p->pool), fd, page_size, db_size);
 
     size_t bytes_for_bitmask = ceil(res->p->pool.sizes.pages_count / 8.0);
-    write(fd, &(res->p->meta), sizeof(struct DBMeta));
-    write(fd, res->p->pool.bitmask, bytes_for_bitmask);
+    pwrite(fd, &(res->p->meta), sizeof(struct DBMeta), 0);
+    pwrite(fd, res->p->pool.bitmask, bytes_for_bitmask, sizeof(struct DBMeta));
 
     res->p->top = NULL;
 	return res;
@@ -105,7 +53,7 @@ struct DB *dbopen(char *file)
     struct DB *res = (struct DB *)malloc(sizeof(struct DB));
     res->p = (struct DBPrivate *)malloc(sizeof(struct DBPrivate));
     int fd = open(file, O_RDWR, 0);
-    read(fd, &(res->p->meta), sizeof(struct DBMeta));
+    pread(fd, &(res->p->meta), sizeof(struct DBMeta), 0);
     size_t db_size = res->p->meta.db_size;
     size_t page_size = res->p->meta.page_size;
     _init_pool(&(res->p->pool), fd, page_size, db_size);
@@ -114,7 +62,7 @@ struct DB *dbopen(char *file)
     size_t bytes_for_bitmask = ceil(npages / 8.0);
     size_t pages_for_bitmask = res->p->pool.sizes.pages_for_bitmask;
 
-    read(fd, res->p->pool.bitmask, bytes_for_bitmask);
+    pread(fd, res->p->pool.bitmask, bytes_for_bitmask, sizeof(struct DBMeta));
 
     size_t nodes = 0;
     size_t bitmask_start = pages_for_bitmask;
@@ -124,8 +72,9 @@ struct DB *dbopen(char *file)
         if (bit_test(res->p->pool.bitmask, i)) ++nodes;
     }
 
-    if (nodes == 0) res->p->top = NULL;
-    else {
+    if (nodes == 0) {
+        res->p->top = NULL;
+    } else {
         res->p->top = _read_node_from_page(res, res->p->pool.sizes.top_page);
     }
     res->p->pool.sizes.nodes = nodes;
@@ -176,7 +125,9 @@ void _init_pool(struct PoolPages *pool, int fd, size_t page_size, size_t db_size
 
     void *bitmask = (void *)malloc(bytes_for_bitmask);
     memset(bitmask, 0, bytes_for_bitmask);
-    memset(bitmask, 1, pages_for_bitmask);
+    for (int i = 0; i < pages_for_bitmask; ++i) {
+        bit_set(bitmask, i);
+    }
 
     pool->fd = fd;
     pool->bitmask = bitmask;
@@ -217,7 +168,7 @@ struct Node *_init_node(size_t parent_page, size_t flags, size_t size, size_t ch
     return node;
 }
 
-bool _dump_node(struct DB *db, struct Node *node)
+bool _dump_new_node(struct DB *db, struct Node *node)
 {
     size_t bitmask_start = db->p->pool.sizes.pages_for_bitmask;
     size_t bitmask_end = db->p->pool.sizes.pages_count;
@@ -261,4 +212,26 @@ struct Node *_read_node_from_page(struct DB *db, size_t page)
     page_offset += sizeof(struct DBT) * K;
     pread(db->p->pool.fd, node->values, sizeof(struct DBT) * K, page_offset);
     return node;
+}
+
+void printDB(struct DB *db)
+{
+    printf("Name: %s\n", db->p->db_name);
+    if (db->p->top == NULL) {
+        printf("Top: NULL\n");
+    } else {
+        printf("Top: page = %d, parent page = %d, size = %d\n", (int)(db->p->top->meta.page), (int)(db->p->top->meta.parent_page),
+               (int)(db->p->top->meta.size));
+        printf("childs: ");
+        for (int i = 0; i < K + 1; ++i) {
+            printf("%d ", (int)(db->p->top->childs[i]));
+        }
+        printf("\n");
+    }
+    printf("Page pool: ");
+    struct PoolPages *pool = &(db->p->pool);
+    printf("pages count = %d, pages for bitmask = %d, node meta size = %d, one pair size = %d, top page = %d, nodes = %d\n",
+           (int)(pool->sizes.pages_count), (int)(pool->sizes.pages_for_bitmask), (int)(pool->sizes.node_meta_size),
+           (int)(pool->sizes.one_pair_size), (int)(pool->sizes.top_page), (int)(pool->sizes.nodes));
+    printf("DB meta: db size = %d, page size = %d\n", (int)(db->p->meta.db_size), (int)(db->p->meta.page_size));
 }
