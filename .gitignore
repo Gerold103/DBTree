@@ -2,3 +2,6 @@
 *.out
 *~
 *.o
+*.pro
+*.user
+*.pro.user
