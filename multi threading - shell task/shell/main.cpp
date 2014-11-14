@@ -108,7 +108,7 @@ int main()
     string command_line;
     while (getline(cin, command_line)) {
         auto commands = parse_pipes(parse_string(command_line));
-        if (!shell_flags(commands.back()) & PARALL) signal(SIGCHLD, SIG_DFL);
+        if (!(shell_flags(commands.back()) & PARALL)) signal(SIGCHLD, SIG_DFL);
         else signal(SIGCHLD, handler);
         int prev[2], next[2];
         if (commands.size() > 1) {
@@ -153,14 +153,6 @@ int main()
                         dup2(prev[0], 0);
                         close(prev[1]);
                         close(prev[0]);
-
-                        if (flags & REDIR) {
-                            string path = commands[i].back();
-                            int fd = open(path.c_str(), O_WRONLY | O_APPEND);
-                            close(1);
-                            dup2(fd, 1);
-                            commands[i].erase(commands[i].end() - 2, commands[i].end());
-                        }
                     } else {
                         close(1);
                         close(0);
@@ -170,6 +162,15 @@ int main()
                         close(next[0]);
                         close(prev[0]);
                         close(next[1]);
+                    }
+                }
+                if (i == commands.size() - 1) {
+                    if (flags & REDIR) {
+                        string path = commands[i].back();
+                        int fd = open(path.c_str(), O_WRONLY | O_APPEND);
+                        close(1);
+                        dup2(fd, 1);
+                        commands[i].erase(commands[i].end() - 2, commands[i].end());
                     }
                 }
                 if (flags & PARALL) {
