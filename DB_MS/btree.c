@@ -10,19 +10,28 @@
 struct DB *dbcreate(const char *file, const struct DBC conf);
 struct DB *dbopen  (const char *file);
 
-int db_close (struct DB *db) { return 0; }
-int db_del (struct DB *db, struct DBT *key) { return 0; }
-int db_get (struct DB *db, struct DBT *key, struct DBT *data) { return 0; }
+int db_close (struct DB *db);
+int db_del (struct DB *db, struct DBT *key);
+int db_get (struct DB *db, struct DBT *key, struct DBT *data);
 int db_put (struct DB *db, struct DBT *key, struct DBT *data);
 
-void         bit_set(char val, int pos, char *bits);
-int          bit_get(int pos, char *bits);
-struct Node *alloc_node  (struct DB *db);
-struct Node *load_node   (struct DB *db, int page);
-int          dump_node   (struct DB *db, struct Node *node);
-int          compare_keys(struct DBT *left, struct DBT *right);
-int insert(struct DB *db, struct DBT *key, struct DBT *data, struct Node *node);
-int          split_node_by_rec(struct DB *db, struct Node *node, int pos);
+static int db_del_recurs(struct DB *db, struct Node *node, struct DBT *key);
+
+void         bit_set            (char val, int pos, char *bits);
+int          bit_get            (int pos, char *bits);
+struct Node *alloc_node         (struct DB *db);
+struct Node *load_node          (struct DB *db, int page);
+int          delete_node        (struct DB *db, struct Node *node);
+int          dump_node          (struct DB *db, struct Node *node);
+int          compare_keys       (struct DBT *left, struct DBT *right);
+int          insert             (struct DB *db, struct DBT *key, struct DBT *data, struct Node *node);
+int          get                (struct DB *db, struct DBT *key, struct DBT *data, struct Node *node);
+int          split_node_by_rec  (struct DB *db, struct Node *node, int pos);
+int          find_free_after_key(struct Node *node, struct DBT *key);
+void rewrite_record(struct Record *rec1, struct Record *rec2);
+void rewrite_raw_record(struct DBT *key, struct DBT *data, struct Record *rec);
+void rewrite_record_from_raw(struct Record *rec, struct DBT *key, struct DBT *data);
+void move_records(int start, int end, int step, struct Record *records_left, struct Record *records_right);
 
 //----------------------------------------------------------------------------------------
 
@@ -48,6 +57,9 @@ struct DB *dbcreate(const char *file, const struct DBC conf)
     db->root->size = 0;
     db->root->tree_param = (conf.chunk_size - 32) / (2 * sizeof(struct Record));
     db->root->flags |= IS_LEAF;
+
+    db->close(db);
+    db = dbopen(file);
     printf("dbcreate: end db creating\n");
     return db;
 }
@@ -106,6 +118,15 @@ struct Node *load_node (struct DB *db, int page)
     return node;
 }
 
+int delete_node(struct DB *db, struct Node *node)
+{
+    printf("delete_node: start node deleting\n");
+    bit_set(0, node->offset, db->bitmask);
+    db->first_free = fmin(db->first_free, node->offset);
+    printf("delete_node: end node deleting\n");
+    return 0;
+}
+
 int dump_node (struct DB *db, struct Node *node)
 {
     printf("dump_node: start node dumping\n");
@@ -127,56 +148,68 @@ int compare_keys(struct DBT *left, struct DBT *right)
 int insert(struct DB *db, struct DBT *key, struct DBT *data, struct Node *node)
 {
    printf("insert: start inserting\n");
-   int pos_for_ins = 0;
    //Finds position for new record
-   while ((pos_for_ins < node->size) &&
-          (compare_keys(&(node->records[pos_for_ins].key), key) < 0)) {
-       ++pos_for_ins;
-   }
+   int i = find_free_after_key(node, key);
 
    //If keys are equal, that it is neccessary to rewrite value
-   if (!compare_keys(key, &(node->records[pos_for_ins].key))) {
-       node->records[pos_for_ins].data = *data;
+   if (!compare_keys(key, &(node->records[i].key))) {
+       node->records[i].data = *data;
        printf("insert: end inserting. Record with such key already was in base\n");
        return dump_node(db, node);
    }
 
    if (node->flags & IS_LEAF) {
        node->records[node->size + 1].offset = node->records[node->size].offset;
-       for (int j = node->size - 1; j >= pos_for_ins; --j) {
-           node->records[j + 1] = node->records[j];
-       }
-       node->records[pos_for_ins].key = *key;
-       node->records[pos_for_ins].data = *data;
+       move_records(node->size, i, -1, node->records, node->records);
+       rewrite_record_from_raw(&(node->records[i]), key, data);
        node->size++;
        printf("insert: end inserting in leaf node\n");
        return dump_node(db, node);
    }
 
    //If it is new record and we are not in leaf-node, but inside tree
-   //Load the node-child of record on <pos_for_ins> position
-   struct Node *chld = load_node(db, node->records[pos_for_ins].offset);
+   //Load the node-child of record on <i> position
+   struct Node *chld = load_node(db, node->records[i].offset);
 
    //If child is full
    if (chld->size >= 2 * chld->tree_param - 1) {
        //splitting node by this position
        free(chld);
-       if (split_node_by_rec(db, node, pos_for_ins)) {
+       if (split_node_by_rec(db, node, i)) {
            printf("insert: end inserting with error while spliting\n");
            return -1;
        }
        //move position if val on current is smaller
-       if (compare_keys(&(node->records[pos_for_ins].key), key) < 0) {
-           ++pos_for_ins;
+       if (compare_keys(&(node->records[i].key), key) < 0) {
+           ++i;
        }
        //load this new node
-       chld = load_node(db, node->records[pos_for_ins].offset);
+       chld = load_node(db, node->records[i].offset);
    }
    //fall down in this neccessary child
    int result = insert(db, key, data, chld);
    free(chld);
    printf("insert: end inserting inside tree\n");
    return result;
+}
+
+int get(struct DB *db, struct DBT *key, struct DBT *data, struct Node *node)
+{
+    printf("get: start getting\n");
+    int i = find_free_after_key(node, key);
+    if ((i < node->size) && (compare_keys(&(node->records[i].key), key) == 0)) {
+        *data = node->records[i].data;
+        printf("get: end getting, val is found\n");
+        return 0;
+    }
+    if (!(node->flags & IS_LEAF)) {
+        struct Node *next = load_node(db, node->records[i].offset);
+        int res = get(db, key, data, next);
+        free(next);
+        return res;
+    }
+    printf("get: end getting, val isn't found\n");
+    return -1;
 }
 
 int split_node_by_rec(struct DB *db, struct Node *node, int pos)
@@ -188,18 +221,13 @@ int split_node_by_rec(struct DB *db, struct Node *node, int pos)
     new_child->tree_param = tree_param;
     new_child->flags = old_child->flags;
     new_child->size = old_child->size - tree_param;
-    for (int i = 0; i < new_child->size; ++i) {
-        new_child->records[i] = old_child->records[i + tree_param];
-    }
+    move_records(0, new_child->size, tree_param, new_child->records, old_child->records);
     new_child->records[new_child->size].offset = old_child->records[old_child->size].offset;
     node->records[node->size + 1].offset = node->records[node->size].offset;
-    for (int i = node->size; i > pos; --i) {
-        node->records[i] = node->records[i - 1];
-    }
+    move_records(node->size, pos, -1, node->records, node->records);
     node->records[pos].offset = old_child->offset;
     node->records[pos + 1].offset = new_child->offset;
-    node->records[pos].key = old_child->records[tree_param - 1].key;
-    node->records[pos].data = old_child->records[tree_param - 1].data;
+    rewrite_record(&(node->records[pos]), &(node->records[tree_param - 1]));
     old_child->size = tree_param - 1;
     node->size++;
     dump_node(db, new_child);
@@ -209,6 +237,53 @@ int split_node_by_rec(struct DB *db, struct Node *node, int pos)
     free(old_child);
     printf("split_node_by_rec: end spliting\n");
     return 0;
+}
+
+int find_free_after_key(struct Node *node, struct DBT *key)
+{
+    int i = 0;
+    while ((i < node->size) && (compare_keys(&(node->records[i].key), key) < 0)) {
+        ++i;
+    }
+    return i;
+}
+
+int db_close (struct DB *db)
+{
+    printf("db_close: start database closing\n");
+
+    dump_node(db, db->root);
+    db->root_offset = db->root->offset;
+    fseek(db->db_file, 0, SEEK_SET);
+    fwrite(db, sizeof(struct DB), 1, db->db_file);
+    fseek(db->db_file, db->config.chunk_size, SEEK_SET);
+    fwrite(db->bitmask, 1, db->capacity, db->db_file);
+    free(db->bitmask);
+    free(db->root);
+    fclose(db->db_file);
+    free(db);
+
+    printf("db_close: end database closing\n");
+    return 0;
+}
+
+int db_del (struct DB *db, struct DBT *key)
+{
+    printf("db_del: start value deleting\n");
+    int result = db_del_recurs(db, db->root, key);
+    if (db->root->size == 0) {
+        struct Node *empty_node = load_node(db, db->root->records[0].offset);
+        delete_node(db, db->root);
+        free(db->root);
+        db->root = empty_node;
+    }
+    printf("db_del: end value deleting\n");
+    return result;
+}
+
+int db_get (struct DB *db, struct DBT *key, struct DBT *data)
+{
+    return get(db, key, data, db->root);
 }
 
 int db_put (struct DB *db, struct DBT *key, struct DBT *data)
@@ -228,6 +303,213 @@ int db_put (struct DB *db, struct DBT *key, struct DBT *data)
     }
     return insert(db, key, data, root);
     printf("db_put: end putting\n");
+}
+
+void lift_right_record(struct DB *db, struct Node *node, struct DBT *key, struct DBT *data)
+{
+    if (node->flags & IS_LEAF) {
+        rewrite_raw_record(key, data, &(node->records[node->size - 1]));
+    } else {
+        struct Node *next = load_node(db, node->records[node->size].offset);
+        lift_right_record(db, next, key, data);
+        free(next);
+    }
+}
+
+void lift_left_record(struct DB *db, struct Node *node, struct DBT *key, struct DBT *data)
+{
+    if (node->flags & IS_LEAF) {
+        rewrite_raw_record(key, data, &(node->records[0]));
+    } else {
+        struct Node *next = load_node(db, node->records[0].offset);
+        lift_left_record(db, node, key, data);
+        free(next);
+    }
+}
+
+int del_from_subtree(struct DB *db, struct Node *node, struct Node *child, void (*lifter)(struct DB *, struct Node *, struct DBT *, struct DBT *), int i)
+{
+   if (child->size < child->tree_param) return -1;
+   lifter(db, child, &(node->records[i].key), &(node->records[i].data));
+   db_del_recurs(db, child, &(node->records[i].key));
+   return dump_node(db, node);
+}
+
+int db_del_recurs(struct DB *db, struct Node *node, struct DBT *key)
+{
+    int i = find_free_after_key(node, key);
+    //If key is found
+    if ((i < node->size) && (compare_keys(&(node->records[i].key), key) == 0)) {
+        //Bottom of tree
+        if (node->flags & IS_LEAF) {
+            //Moving right records to left
+            move_records(i, node->size - 1, 1, node->records, node->records);
+            node->size--;
+            return dump_node(db, node);
+        } else {
+            //Reorganize left subtree
+            struct Node *left_child = load_node(db, node->records[i].offset);
+            if (!del_from_subtree(db, node, left_child, lift_right_record, i)) {
+                free(left_child);
+                return 0;
+            }
+            //Reorganize right subtree
+            struct Node *right_child = load_node(db, node->records[i + 1].offset);
+            if (!del_from_subtree(db, node, right_child, lift_left_record, i)) {
+                free(left_child);
+                free(right_child);
+                return 0;
+            }
+            //Left and right contains minimum records
+            int ls = left_child->size;
+            rewrite_record(&(left_child->records[ls]), &(node->records[i]));
+            for (int k = i; k < node->size - 1; ++k) {
+                rewrite_record(&(node->records[k]), &(node->records[k + 1]));
+                node->records[k + 1].offset = node->records[k + 2].offset;
+            }
+            node->size--;
+            //Merging right to left subtrees
+            move_records(ls + 1, right_child->size + ls + 1, -1 - ls, left_child->records, right_child->records);
+            left_child->size += right_child->size + 1;
+            ls = left_child->size;
+            int rs = right_child->size;
+            left_child->records[ls].offset = right_child->records[rs].offset;
+            delete_node(db, right_child);
+            dump_node(db, node);
+            int result = db_del_recurs(db, left_child, key);
+            free(left_child);
+            return result;
+        }
+    //Key is not found in current node
+    } else {
+        struct Node *next = load_node(db, node->records[i].offset);
+        //If contains minimum records
+        if (next->size < next->tree_param) {
+            struct Node *left = NULL, *right = NULL;
+            //If not first record
+            if (i > 0) {
+                left = load_node(db, node->records[i - 1].offset);
+                //If contains more than minimum records
+                if (left->size >= left->tree_param) {
+                    next->records[next->size + 1].offset = next->records[next->size].offset;
+                    move_records(next->size, 0, -1, next->records, next->records);
+                    next->size++;
+                    rewrite_record(&(next->records[0]), &(node->records[i - 1]));
+                    rewrite_record(&(node->records[i - 1]), &(left->records[left->size - 1]));
+                    next->records[0].offset = left->records[left->size].offset;
+                    left->size--;
+                    dump_node(db, left);
+                    dump_node(db, node);
+                    free(left);
+                    int result = db_del_recurs(db, next, key);
+                    free(next);
+                    return result;
+                }
+            }
+            //If not last record
+            if (i < node->size) {
+                right = load_node(db, node->records[i + 1].offset);
+                //If contains more than minimum records
+                if (right->size >= right->tree_param) {
+                    rewrite_record(&(next->records[next->size]), &(node->records[i]));
+                    next->records[next->size + 1].offset = right->records[0].offset;
+                    next->size++;
+                    rewrite_record(&(node->records[i]), &(right->records[0]));
+                    move_records(0, right->size - 1, 1, right->records, right->records);
+                    right->records[right->size - 1].offset = right->records[right->size].offset;
+                    right->size--;
+                    dump_node(db, right);
+                    dump_node(db, node);
+                    free(left);
+                    free(right);
+                    int result = db_del_recurs(db, next, key);
+                    return result;
+                }
+            }
+            if (i > 0) {
+                int ls = left->size;
+                rewrite_record(&(left->records[ls]), &(node->records[i - 1]));
+                move_records(ls + 1, next->size + ls + 1, -1 - ls, left->records, next->records);
+                left->size += next->size + 1;
+                ls = left->size;
+                left->records[ls].offset = next->records[next->size].offset;
+                delete_node(db, next);
+                free(next);
+                for (int k = i - 1; k < node->size; ++k) {
+                    rewrite_record(&(node->records[k]), &(node->records[k + 1]));
+                    node->records[k + 1].offset = node->records[k + 2].offset;
+                }
+                node->size--;
+                dump_node(db, node);
+                dump_node(left, db);
+                free(right);
+                int result = db_del_recurs(db, left, key);
+                free(left);
+                return result;
+            }
+            if (i < node->size) {
+                int ns = next->size;
+                rewrite_record(&(next->records[ns]), &(node->records[i]));
+                move_records(ns + 1, right->size + ns + 1, -1 - ns, next->records, right->records);
+                next->size += right->size + 1;
+                ns = next->size;
+                next->records[ns].offset = right->records[right->size].offset;
+                delete_node(db, right);
+                free(right);
+                for (int k = i; k < node->size - 1; ++k) {
+                    rewrite_record(&(node->records[k]), &(node->records[k + 1]));
+                    node->records[k + 1].offset = node->records[k + 2].offset;
+                }
+                node->size--;
+                dump_node(db, node);
+                dump_node(db, next);
+                free(left);
+                int result = db_del_recurs(db, next, key);
+                free(next);
+                return result;
+            }
+            return -1;
+        } else {
+            if (!(node->flags & IS_LEAF)) {
+                int res = db_del_recurs(db, next, key);
+                free(next);
+                return res;
+            } else {
+                return 0;
+            }
+        }
+    }
+}
+
+void rewrite_record(struct Record *rec1, struct Record *rec2)
+{
+    rec1->data = rec2->data;
+    rec1->key = rec2->key;
+}
+
+void rewrite_raw_record(struct DBT *key, struct DBT *data, struct Record *rec)
+{
+    *key = rec->key;
+    *data = rec->data;
+}
+
+void rewrite_record_from_raw(struct Record *rec, struct DBT *key, struct DBT *data)
+{
+    rec->key = *key;
+    rec->data = *data;
+}
+
+void move_records(int start, int end, int step, struct Record *records_left, struct Record *records_right)
+{
+    if (start <= end) {
+        for (int i = start; i < end; ++i) {
+            records_left[i] = records_right[i + step];
+        }
+    } else {
+        for (int i = start; i > end; ++i) {
+            records_left[i] = records_right[i + step];
+        }
+    }
 }
 
 void print_tree(struct DB *db, struct Node *node, int k)

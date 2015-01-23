@@ -39,6 +39,12 @@ int main()
     init(&anotherdata, "datadatadata");
     db->put(db, &anotherkey, &anotherdata);
     print_tree(db, db->root, 1);
+
+    db->del(db, &(keys[0]));
+    db->del(db, &anotherkey);
+    print_tree(db, db->root, 1);
+
+
     free(keys[0].data);
     free(keys[1].data);
     free(keys[2].data);
